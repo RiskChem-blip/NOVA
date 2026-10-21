@@ -7,17 +7,31 @@ android {
     namespace = "app.nova.tv"
     compileSdk = 34
 
+    // Numéro de version = numéro de fabrication GitHub : chaque APK remplace le précédent
+    val runNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+
     defaultConfig {
         applicationId = "app.nova.tv"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = runNumber
+        versionName = "1.0.$runNumber"
+    }
+
+    // Toujours la même signature : les mises à jour s'installent par-dessus, sans tout perdre
+    signingConfigs {
+        create("nova") {
+            storeFile = file("nova.keystore")
+            storePassword = "novatv2026"
+            keyAlias = "nova"
+            keyPassword = "novatv2026"
+        }
     }
 
     buildTypes {
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("nova")
         }
     }
 

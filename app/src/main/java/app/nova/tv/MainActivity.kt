@@ -28,6 +28,7 @@ import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.UnknownHostException
 import javax.net.ssl.SSLException
+import org.json.JSONObject
 
 /**
  * Écran principal : affiche l'interface Nova (fichier assets/index.html) dans une WebView.
@@ -80,7 +81,7 @@ class MainActivity : ComponentActivity() {
                 val u = request.url
                 if (u.host != "nova.proxy") return null
                 val target = u.getQueryParameter("u") ?: return proxyError("other", "adresse manquante")
-                return proxyFetch(target)
+                return proxyFetch(target, parseHeaders(u.getQueryParameter("h")))
             }
         }
         web.webChromeClient = WebChromeClient()
@@ -129,7 +130,20 @@ class MainActivity : ComponentActivity() {
     private val corsHeaders: Map<String, String>
         get() = mapOf("Access-Control-Allow-Origin" to "*", "Cache-Control" to "no-store")
 
-    private fun openFollowingRedirects(target: String): HttpURLConnection {
+    /** En-têtes supplémentaires demandés par l'interface (abonnement MAG : cookie, identité du boîtier…). */
+    private fun parseHeaders(json: String?): Map<String, String> {
+        if (json.isNullOrBlank()) return emptyMap()
+        return try {
+            val o = JSONObject(json)
+            val m = LinkedHashMap<String, String>()
+            for (k in o.keys()) m[k] = o.optString(k)
+            m
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    private fun openFollowingRedirects(target: String, headers: Map<String, String> = emptyMap()): HttpURLConnection {
         var url = URL(target)
         repeat(6) {
             val c = url.openConnection() as HttpURLConnection
@@ -138,6 +152,7 @@ class MainActivity : ComponentActivity() {
             c.instanceFollowRedirects = false
             c.setRequestProperty("User-Agent", "Nova/1.0 (Linux; Android)")
             c.setRequestProperty("Accept", "*/*")
+            for ((k, v) in headers) c.setRequestProperty(k, v)
             val code = c.responseCode
             val loc = c.getHeaderField("Location")
             if (code in 300..399 && loc != null) {
@@ -150,9 +165,9 @@ class MainActivity : ComponentActivity() {
         throw IOException("trop de redirections")
     }
 
-    private fun proxyFetch(target: String): WebResourceResponse {
+    private fun proxyFetch(target: String, headers: Map<String, String> = emptyMap()): WebResourceResponse {
         return try {
-            val c = openFollowingRedirects(target)
+            val c = openFollowingRedirects(target, headers)
             val code = c.responseCode
             val ok = code in 200..299
             val stream = if (ok) c.inputStream else (c.errorStream ?: ByteArrayInputStream(ByteArray(0)))

@@ -50,10 +50,31 @@ ouvre-le et accepte l'installation depuis cette source.
 | Menus | Retour | Revenir en arrière (2 fois sur l'accueil pour quitter) |
 | Film / série | OK ou ⏯ | Pause / lecture |
 | Film / série | ◀ ▶ | Reculer / avancer de 10 s (maintenir pour aller plus vite) |
+| Film / série | ▼ | Langue audio et sous-titres |
 | TV en direct | ▲ ▼ ou CH+ CH− | Chaîne suivante / précédente |
+| TV en direct | ◀ ▶ | Langue audio et sous-titres |
 | TV en direct | Chiffres | Aller à une chaîne |
+| Partout | Menu ou CC (si la télécommande en a) | Langue audio et sous-titres |
+
+La langue choisie est retenue pour les titres suivants (français par défaut).
+Sur le téléphone, ces choix sont dans la roue dentée et le bouton CC du lecteur.
+
+## Se connecter
+
+Trois façons, selon ce que ton fournisseur t'a donné :
+
+- **Xtream Codes** : adresse du serveur, nom d'utilisateur, mot de passe.
+- **Lien M3U** : un lien de playlist, ou un fichier .m3u.
+- **MAG** : adresse du portail (souvent `http://exemple.com:8080/c/`) et adresse MAC
+  (`00:1A:79:…`, celle enregistrée sur ton abonnement). Uniquement dans l'appli Android.
 
 ## Mettre à jour l'appli
 
 Remplace les fichiers modifiés sur GitHub (**Add file › Upload files**) : un nouvel APK
 se fabrique tout seul, et le lien direct pointe toujours vers la dernière version.
+
+Toutes les versions sont signées avec la même clé (`app/nova.keystore`) : une mise à jour
+s'installe par-dessus l'ancienne, sans perdre ta connexion ni tes favoris. Ne supprime pas ce fichier.
+
+> Les versions fabriquées avant l'ajout de cette clé avaient une signature différente :
+> pour passer à la nouvelle, désinstalle Nova **une seule fois**, puis installe-la.

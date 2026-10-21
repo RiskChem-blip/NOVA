@@ -1,5 +1,6 @@
 package app.nova.tv
 
+import android.app.AlertDialog
 import android.app.UiModeManager
 import android.content.Context
 import android.content.Intent
@@ -9,6 +10,7 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -30,16 +32,24 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import org.json.JSONObject
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
 
 /**
@@ -92,6 +102,12 @@ class PlayerActivity : ComponentActivity() {
     private var digits = ""
     private val digitRunnable = Runnable { jumpToNumber() }
 
+    // Abonnement MAG : adresse de l'API du portail et en-têtes du boîtier
+    private var magApi = ""
+    private var magHeaders: Map<String, String> = emptyMap()
+
+    private val prefs by lazy { getSharedPreferences("nova_player", Context.MODE_PRIVATE) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -127,17 +143,32 @@ class PlayerActivity : ComponentActivity() {
         }
         val startIndex = json.optInt("index", 0).coerceIn(0, items.size - 1)
         val startMs = json.optLong("start", 0L)
+        json.optJSONObject("mag")?.let { m ->
+            magApi = m.optString("api")
+            val h = m.optJSONObject("headers")
+            if (h != null) {
+                val map = LinkedHashMap<String, String>()
+                for (k in h.keys()) map[k] = h.optString(k)
+                magHeaders = map
+            }
+        }
 
         buildUi()
 
         val http = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
-            .setUserAgent("Nova/1.0 (Linux; Android)")
+            .setUserAgent(magHeaders["User-Agent"] ?: "Nova/1.0 (Linux; Android)")
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(20000)
+        if (magHeaders.isNotEmpty()) http.setDefaultRequestProperties(magHeaders.filterKeys { it != "User-Agent" })
+        // Les liens « novamag:// » sont demandés au portail juste avant la lecture (lien à usage unique)
+        val sources = ResolvingDataSource.Factory(http) { spec ->
+            if (spec.uri.scheme == "novamag") spec.withUri(resolveMag(spec.uri)) else spec
+        }
         player = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(http))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(sources))
             .build()
+        applySavedLanguages()
         player.setAudioAttributes(
             AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)
@@ -181,6 +212,7 @@ class PlayerActivity : ComponentActivity() {
         playerView = PlayerView(this)
         playerView.useController = !tv
         playerView.setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
+        playerView.setShowSubtitleButton(true)
         playerView.keepScreenOn = true
         if (!tv) {
             playerView.controllerShowTimeoutMs = 3500
@@ -295,6 +327,37 @@ class PlayerActivity : ComponentActivity() {
     }
 
     // ---------- Lecture ----------
+
+    private fun urlIn(s: String?): String = Regex("https?://\\S+").find(s ?: "")?.value ?: ""
+
+    /** Demande au portail MAG le vrai lien du flux (appelé hors du fil principal par le lecteur). */
+    private fun resolveMag(uri: Uri): Uri {
+        val type = uri.getQueryParameter("t") ?: "itv"
+        val cmd = uri.getQueryParameter("c") ?: ""
+        val series = uri.getQueryParameter("s") ?: ""
+        if (magApi.isNotEmpty()) {
+            try {
+                val enc = { v: String -> URLEncoder.encode(v, "UTF-8") }
+                val q = "$magApi?type=${enc(type)}&action=create_link&cmd=${enc(cmd)}&series=${enc(series)}" +
+                    "&forced_storage=0&disable_ad=0&download=0&JsHttpRequest=1-xml"
+                val c = URL(q).openConnection() as HttpURLConnection
+                c.connectTimeout = 15000
+                c.readTimeout = 20000
+                for ((k, v) in magHeaders) c.setRequestProperty(k, v)
+                val body = try {
+                    c.inputStream.bufferedReader().use { it.readText() }
+                } finally {
+                    c.disconnect()
+                }
+                val real = urlIn(JSONObject(body).optJSONObject("js")?.optString("cmd"))
+                if (real.isNotEmpty()) return Uri.parse(real)
+            } catch (_: Exception) {
+            }
+        }
+        val direct = urlIn(cmd)
+        if (direct.isNotEmpty() && !direct.contains("://localhost")) return Uri.parse(direct)
+        throw IOException("Le portail MAG n'a pas donné de lien pour ce titre")
+    }
 
     private fun mediaItem(it: Item, index: Int, forcedMime: String?): MediaItem {
         val b = MediaItem.Builder().setUri(it.url).setMediaId(index.toString())
@@ -418,7 +481,8 @@ class PlayerActivity : ComponentActivity() {
         KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
         KeyEvent.KEYCODE_MEDIA_REWIND, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
         KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_CHANNEL_DOWN,
-        KeyEvent.KEYCODE_MEDIA_NEXT, KeyEvent.KEYCODE_MEDIA_PREVIOUS, KeyEvent.KEYCODE_INFO
+        KeyEvent.KEYCODE_MEDIA_NEXT, KeyEvent.KEYCODE_MEDIA_PREVIOUS, KeyEvent.KEYCODE_INFO,
+        KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_CAPTIONS, KeyEvent.KEYCODE_MEDIA_AUDIO_TRACK
     )
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -444,12 +508,14 @@ class PlayerActivity : ComponentActivity() {
             KeyEvent.KEYCODE_SPACE, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> if (rep == 0) togglePause()
             KeyEvent.KEYCODE_MEDIA_PLAY -> { player.play(); showOverlay(false) }
             KeyEvent.KEYCODE_MEDIA_PAUSE -> { player.pause(); showOverlay(true) }
-            KeyEvent.KEYCODE_DPAD_LEFT -> if (live) showOverlay(false) else seekBy(-10_000L * (1 + rep / 4))
-            KeyEvent.KEYCODE_DPAD_RIGHT -> if (live) showOverlay(false) else seekBy(10_000L * (1 + rep / 4))
+            KeyEvent.KEYCODE_DPAD_LEFT -> if (live) { if (rep == 0) showTracksMenu() } else seekBy(-10_000L * (1 + rep / 4))
+            KeyEvent.KEYCODE_DPAD_RIGHT -> if (live) { if (rep == 0) showTracksMenu() } else seekBy(10_000L * (1 + rep / 4))
             KeyEvent.KEYCODE_MEDIA_REWIND -> if (!live) seekBy(-30_000L)
             KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> if (!live) seekBy(30_000L)
             KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> if (live) { if (rep == 0) zap(1) } else showOverlay(false)
-            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN -> if (live) { if (rep == 0) zap(-1) } else showOverlay(false)
+            KeyEvent.KEYCODE_DPAD_DOWN -> if (live) { if (rep == 0) zap(-1) } else if (rep == 0) showTracksMenu()
+            KeyEvent.KEYCODE_CHANNEL_DOWN -> if (live) { if (rep == 0) zap(-1) } else showOverlay(false)
+            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_CAPTIONS, KeyEvent.KEYCODE_MEDIA_AUDIO_TRACK -> if (rep == 0) showTracksMenu()
             KeyEvent.KEYCODE_MEDIA_NEXT -> if (rep == 0) {
                 if (live) zap(1) else if (player.hasNextMediaItem()) player.seekToNextMediaItem()
             }
@@ -460,6 +526,134 @@ class PlayerActivity : ComponentActivity() {
             else -> if (isDigit && live && rep == 0) typeDigit(k - KeyEvent.KEYCODE_0)
         }
         return true
+    }
+
+    // ---------- Langue audio et sous-titres ----------
+
+    private class Choice(val label: String, val group: Tracks.Group, val index: Int)
+
+    /** Remet les langues choisies la dernière fois (français par défaut pour l'audio). */
+    private fun applySavedLanguages() {
+        val b = player.trackSelectionParameters.buildUpon()
+        b.setPreferredAudioLanguage(prefs.getString("audio", "fr"))
+        when (val t = prefs.getString("text", null)) {
+            null -> {}
+            "off" -> b.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            else -> b.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage(t)
+        }
+        player.trackSelectionParameters = b.build()
+    }
+
+    private fun trackName(f: Format, n: Int, type: Int): String {
+        val parts = ArrayList<String>()
+        val lang = f.language
+        if (!lang.isNullOrEmpty() && lang != "und") {
+            val name = Locale.forLanguageTag(lang).getDisplayLanguage(Locale.FRENCH)
+            parts.add(
+                if (name.isNotEmpty() && !name.equals(lang, true)) name.replaceFirstChar { it.titlecase(Locale.FRENCH) }
+                else lang.uppercase(Locale.ROOT)
+            )
+        }
+        val label = f.label
+        if (!label.isNullOrBlank() && parts.none { it.equals(label, true) }) parts.add(label)
+        if (type == C.TRACK_TYPE_AUDIO) {
+            when (f.channelCount) {
+                1 -> parts.add("mono")
+                2 -> parts.add("stéréo")
+                6 -> parts.add("5.1")
+                8 -> parts.add("7.1")
+            }
+        }
+        if (type == C.TRACK_TYPE_TEXT && (f.selectionFlags and C.SELECTION_FLAG_FORCED) != 0) parts.add("forcés")
+        if (parts.isEmpty()) return if (type == C.TRACK_TYPE_AUDIO) "Piste $n" else "Sous-titres $n"
+        return parts.joinToString("  ·  ")
+    }
+
+    private fun choices(type: Int): List<Choice> {
+        val out = ArrayList<Choice>()
+        for (g in player.currentTracks.groups) {
+            if (g.type != type) continue
+            for (i in 0 until g.length) {
+                if (!g.isTrackSupported(i)) continue
+                out.add(Choice(trackName(g.getTrackFormat(i), out.size + 1, type), g, i))
+            }
+        }
+        return out
+    }
+
+    private fun dialog(): AlertDialog.Builder =
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+
+    /** Menu de la télécommande : choisir la langue et les sous-titres du titre en cours. */
+    private fun showTracksMenu() {
+        val audio = choices(C.TRACK_TYPE_AUDIO)
+        val text = choices(C.TRACK_TYPE_TEXT)
+        if (audio.size < 2 && text.isEmpty()) {
+            Toast.makeText(
+                this,
+                if (player.currentTracks.isEmpty) "Patiente, la lecture démarre…" else "Une seule langue et pas de sous-titres pour ce titre",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        val labels = ArrayList<String>()
+        val actions = ArrayList<() -> Unit>()
+        if (audio.size >= 2) {
+            val cur = audio.firstOrNull { it.group.isTrackSelected(it.index) }?.label ?: "automatique"
+            labels.add("Langue : $cur")
+            actions.add { pickTrack(C.TRACK_TYPE_AUDIO, audio) }
+        }
+        if (text.isNotEmpty()) {
+            val cur = text.firstOrNull { it.group.isTrackSelected(it.index) }?.label ?: "désactivés"
+            labels.add("Sous-titres : $cur")
+            actions.add { pickTrack(C.TRACK_TYPE_TEXT, text) }
+        }
+        if (actions.size == 1) {
+            actions[0]()
+            return
+        }
+        dialog().setTitle("Langue et sous-titres")
+            .setItems(labels.toTypedArray()) { _, w -> actions[w]() }
+            .show()
+    }
+
+    private fun pickTrack(type: Int, list: List<Choice>) {
+        val isText = type == C.TRACK_TYPE_TEXT
+        val labels = ArrayList<String>()
+        if (isText) labels.add("Désactivés")
+        list.forEach { labels.add(it.label) }
+        val sel = list.indexOfFirst { it.group.isTrackSelected(it.index) }
+        val checked = if (isText) sel + 1 else sel.coerceAtLeast(0)
+        dialog().setTitle(if (isText) "Sous-titres" else "Langue")
+            .setSingleChoiceItems(labels.toTypedArray(), checked) { d, w ->
+                val b = player.trackSelectionParameters.buildUpon()
+                val edit = prefs.edit()
+                if (isText && w == 0) {
+                    b.clearOverridesOfType(C.TRACK_TYPE_TEXT).setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                    edit.putString("text", "off")
+                } else {
+                    val c = list[if (isText) w - 1 else w]
+                    b.setTrackTypeDisabled(type, false)
+                        .setOverrideForType(TrackSelectionOverride(c.group.mediaTrackGroup, c.index))
+                    val lang = c.group.getTrackFormat(c.index).language
+                    if (!lang.isNullOrEmpty() && lang != "und") {
+                        if (isText) {
+                            b.setPreferredTextLanguage(lang)
+                            edit.putString("text", lang)
+                        } else {
+                            b.setPreferredAudioLanguage(lang)
+                            edit.putString("audio", lang)
+                        }
+                    } else if (isText) {
+                        edit.remove("text")
+                    }
+                }
+                player.trackSelectionParameters = b.build()
+                edit.apply()
+                d.dismiss()
+                showOverlay(false)
+            }
+            .show()
     }
 
     // ---------- Bandeaux d'information ----------
@@ -477,8 +671,8 @@ class PlayerActivity : ComponentActivity() {
         }
         hintView.text = when {
             !tv -> ""
-            live -> "▲ ▼  chaînes     OK  pause     0-9  numéro     Retour  quitter"
-            else -> "◀ ▶  10 s     OK  pause     Retour  quitter"
+            live -> "▲ ▼  chaînes     ◀ ▶  langue     0-9  numéro     Retour  quitter"
+            else -> "◀ ▶  10 s     OK  pause     ▼  langue et sous-titres     Retour  quitter"
         }
         showOverlay(false)
     }

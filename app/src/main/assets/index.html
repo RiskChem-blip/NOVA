@@ -423,6 +423,7 @@ html.tv .grid{padding:6px}
       <div class="seg" role="tablist">
         <button role="tab" data-mode="xtream" aria-selected="true">Xtream Codes</button>
         <button role="tab" data-mode="m3u" aria-selected="false">Lien M3U</button>
+        <button role="tab" data-mode="mag" aria-selected="false">MAG</button>
       </div>
       <form id="fx" class="form" autocomplete="on">
         <div class="field"><label for="xServer">Adresse du serveur</label><input type="url" id="xServer" placeholder="http://exemple.com:8080" required></div>
@@ -435,6 +436,12 @@ html.tv .grid{padding:6px}
         <p class="hint">Un lien « get.php?username=…&password=… » est converti automatiquement en connexion Xtream, pour avoir les affiches, résumés et épisodes.</p>
         <div class="field"><label for="mFile">Ou un fichier .m3u</label><input type="file" id="mFile" accept=".m3u,.m3u8,audio/x-mpegurl,text/plain"></div>
         <button class="btn primary big" type="submit">Charger</button>
+      </form>
+      <form id="fg" class="form" autocomplete="on" hidden>
+        <div class="field"><label for="gPortal">Adresse du portail</label><input type="text" inputmode="url" id="gPortal" placeholder="http://exemple.com:8080/c/" autocapitalize="off" spellcheck="false" required></div>
+        <div class="field"><label for="gMac">Adresse MAC</label><input type="text" id="gMac" placeholder="00:1A:79:XX:XX:XX" value="00:1A:79:" autocapitalize="characters" spellcheck="false" maxlength="17" required></div>
+        <p class="hint">Les deux sont fournis par ton fournisseur (abonnement « MAG » ou « Stalker »). L'adresse MAC est celle enregistrée sur ton abonnement.</p>
+        <button class="btn primary big" type="submit">Se connecter</button>
       </form>
       <p class="err" id="loginErr" hidden></p>
       <div class="or">ou</div>
@@ -501,7 +508,10 @@ try { IS_TV = !!(NATIVE && NATIVE.isTv()); } catch (e) {}
 if (/[?&]tv\b/.test(location.search)) IS_TV = true; // aperçu du mode TV dans un navigateur : nova.html?tv
 document.documentElement.classList.toggle('native', !!NATIVE);
 document.documentElement.classList.toggle('tv', IS_TV);
+// Les adresses « novamag:// » sont converties en vrai lien avant copie
+async function realUrl(u){ return S.src && S.src.resolve && /^novamag:/.test(u) ? S.src.resolve(u) : u; }
 async function copy(t){
+  t = await realUrl(t);
   if (NATIVE) { try { NATIVE.copy(t); toast('Lien copié'); } catch (e) {} return; }
   try { await navigator.clipboard.writeText(t); toast('Lien copié : colle-le dans VLC (Média › Ouvrir un flux réseau)'); } catch (e) { toast(t); }
 }
@@ -526,11 +536,11 @@ const NET_MSG = {
   ssl: "La connexion sécurisée a échoué. Essaie l'adresse avec http:// au lieu de https://.",
   other: "Connexion impossible au serveur."
 };
-async function getText(url, ms = 45000){
+async function getText(url, ms = 45000, headers = null){
   if (NATIVE) ms = 120000;
   const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms);
   let r;
-  try { r = await fetch(NATIVE ? 'https://nova.proxy/?u=' + enc(url) : url, { signal: ac.signal }); }
+  try { r = await fetch(NATIVE ? 'https://nova.proxy/?u=' + enc(url) + (headers ? '&h=' + enc(JSON.stringify(headers)) : '') : url, { signal: ac.signal }); }
   catch (e) {
     throw new NetError(e.name === 'AbortError'
       ? "Le serveur met trop de temps à répondre. Réessaie dans un moment."
@@ -544,8 +554,8 @@ async function getText(url, ms = 45000){
   if (!r.ok) throw new NetError(`Le serveur a répondu « erreur ${r.status} ». Vérifie l'adresse et tes identifiants.`);
   return r.text();
 }
-async function getJSON(url){
-  const t = await getText(url);
+async function getJSON(url, headers = null){
+  const t = await getText(url, 45000, headers);
   try { return JSON.parse(t); }
   catch (e) { throw new NetError("Le serveur a renvoyé une réponse illisible. Vérifie l'adresse : elle ressemble souvent à http://exemple.com:8080, sans rien après."); }
 }
@@ -619,6 +629,176 @@ function xtreamSource(p){
       return `${base}/series/${u}/${pw}/${ep.id}.${ep.ext || 'mp4'}`;
     }
   };
+}
+
+/* Abonnement MAG : portail Stalker / Ministra + adresse MAC. Ne marche que dans l'appli Android,
+   car le portail exige des en-têtes (cookie, identité du boîtier) qu'un navigateur ne peut pas envoyer. */
+const MAG_UA = 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3';
+function normMac(s){ const h = String(s || '').toUpperCase().replace(/[^0-9A-F]/g, ''); return h.length === 12 ? h.match(/../g).join(':') : ''; }
+async function sha256hex(t){
+  try { const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('').toUpperCase(); }
+  catch (e) { let a = ''; for (let i = 0; i < 8; i++) a += hash(t + i).toString(16).padStart(8, '0'); return a.toUpperCase(); }
+}
+const magList = js => Array.isArray(js) ? js : (js && Array.isArray(js.data) ? js.data : []);
+const cmdUrl = cmd => (String(cmd || '').match(/https?:\/\/\S+/) || [''])[0];
+function magSource(p){
+  const mac = normMac(p.mac);
+  let root = String(p.portal || '').trim().replace(/[?#].*$/, '');
+  if (!/^https?:\/\//i.test(root)) root = 'http://' + root;
+  root = root.replace(/\/(index\.html?|portal\.php|server\/load\.php)$/i, '').replace(/\/+$/, '').replace(/\/c$/i, '');
+  const base = root;
+  const tz = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/Paris'; } catch (e) { return 'Europe/Paris'; } })();
+  const cands = /\/stalker_portal$/i.test(base) ? [base + '/server/load.php', base + '/portal.php']
+    : [base + '/portal.php', base + '/server/load.php', base + '/stalker_portal/server/load.php'];
+  let api = '', token = '', sn = '', dev = '';
+  const H = () => {
+    const h = { 'User-Agent':MAG_UA, 'X-User-Agent':'Model: MAG250; Link: WiFi', 'Cookie':`mac=${enc(mac)}; stb_lang=fr; timezone=${enc(tz)}`, 'Referer':base + '/c/', 'Accept':'*/*' };
+    if (token) h.Authorization = 'Bearer ' + token;
+    return h;
+  };
+  const parse = t => { try { return JSON.parse(t); } catch (e) { return null; } };
+  async function handshake(url){
+    token = '';
+    const j = parse(await getText(`${url}?type=stb&action=handshake&token=&prehash=0&JsHttpRequest=1-xml`, 45000, H()));
+    if (!j || !j.js || !j.js.token) return false;
+    token = j.js.token; return true;
+  }
+  async function call(q){
+    const url = `${api}?${q}&JsHttpRequest=1-xml`;
+    let t = await getText(url, 45000, H());
+    if (/authori[sz]ation failed/i.test(t)) { await handshake(api); t = await getText(url, 45000, H()); }
+    const j = parse(t);
+    if (!j) throw new NetError("Le portail a renvoyé une réponse illisible. Vérifie l'adresse du portail et l'adresse MAC.");
+    return j.js;
+  }
+  // Pages d'une liste « get_ordered_list » (14 titres par page en général), chargées par paquets
+  async function pages(q, max){
+    const first = await call(q + '&p=1');
+    const out = magList(first);
+    const per = +(first && first.max_page_items) || out.length || 14, total = +(first && first.total_items) || out.length;
+    const n = Math.min(max, Math.ceil(total / Math.max(1, per)));
+    for (let p = 2; p <= n; p += 6){
+      const batch = [];
+      for (let i = p; i < p + 6 && i <= n; i++) batch.push(call(q + '&p=' + i).then(magList).catch(() => []));
+      (await Promise.all(batch)).forEach(a => out.push(...a));
+    }
+    return { list:out, total };
+  }
+  const logo = l => !l ? '' : /^https?:/i.test(l) ? l : l.startsWith('/') ? base.replace(/^(https?:\/\/[^/]+).*$/, '$1') + l : `${base}/misc/logos/320/${l}`;
+  const year = v => String(v.year || '').slice(0, 4) || ((v.name || '').match(/\((\d{4})\)/) || [])[1] || '';
+  const vod = (v, kind) => {
+    const eps = Array.isArray(v.series) ? v.series : [];
+    const it = { type: eps.length || kind === 'series' ? 'series' : 'movie', id:String(v.id), name:v.name || v.o_name || 'Sans titre',
+      poster:logo(v.screenshot_uri || v.cover || ''), cat:String(v.category_id ?? ''), cmd:v.cmd || '',
+      rating: parseFloat(v.rating_imdb) || parseFloat(v.rating_kinopoisk) || 0, added:(Date.parse(String(v.added || '').replace(' ', 'T')) / 1000) || 0,
+      year:year(v), plot:v.description || '', genre:v.genres_str || '', cast:v.actors || '', director:v.director || '', dur:v.time ? v.time + ' min' : '' };
+    if (eps.length && kind !== 'series') it._eps = eps.map(n => ({ id:`${v.id}-${n}`, season:1, num:+n || 0, title:`Épisode ${n}`, cmd:v.cmd || '', sn:String(n) }));
+    return it;
+  };
+  const T = { movie:'vod', series:'series' };
+  const loaded = { movie:new Set(), series:new Set() };
+  const self = {
+    kind:'mag', base, mac,
+    headers: H,
+    native(){ return { api, headers:H() }; },
+    async auth(){
+      if (!mac) throw new NetError("Adresse MAC invalide. Elle doit compter 12 caractères, par exemple 00:1A:79:12:34:56.");
+      if (!NATIVE) throw new NetError("La connexion MAG ne fonctionne que dans l'appli Nova pour Android (téléphone ou télé), pas dans un navigateur.");
+      sn = (await sha256hex(mac)).slice(0, 13); dev = await sha256hex(mac + 'nova');
+      let err = null;
+      for (const u of cands){
+        try { if (await handshake(u)) { api = u; break; } }
+        catch (e) { err = err || e; if (/introuvable|refuse la connexion|sécurisée|délai|injoignable|met trop/i.test(e.message)) break; }
+      }
+      if (!api) throw (err && !/erreur 404|illisible/i.test(err.message) ? err : new NetError("Portail MAG introuvable à cette adresse. Elle ressemble souvent à http://exemple.com:8080/c/ : vérifie-la auprès de ton fournisseur."));
+      const now = Math.floor(Date.now() / 1000);
+      const prof = await call(`type=stb&action=get_profile&hd=1&ver=${enc('ImageDescription: 0.2.18-r23-250; ImageDate: Thu Sep 13 11:31:16 EEST 2018; PORTAL version: 5.6.2; API Version: JS API version: 343; STB API version: 146; Player Engine version: 0x58c')}&num_banks=2&sn=${sn}&stb_type=MAG250&client_type=STB&image_version=218&video_out=hdmi&device_id=${dev}&device_id2=${dev}&signature=&auth_second_step=1&hw_version=1.7-BD-00&not_valid_token=0&metrics=${enc(JSON.stringify({ mac, sn, type:'STB', model:'MAG250', uid:dev, random:'' }))}&hw_version_2=${dev.slice(0, 40).toLowerCase()}&timestamp=${now}&api_signature=262&prehash=0`);
+      if (prof && prof.token) token = prof.token;
+      if (prof && (prof.blocked === '1' || prof.blocked === 1)) throw new NetError("Le portail indique que cette adresse MAC est bloquée. Contacte ton fournisseur.");
+      if (!prof || (+prof.status > 0 && !+prof.id)) throw new NetError("Adresse MAC refusée par le portail. Vérifie qu'elle est bien celle enregistrée sur ton abonnement." + (prof && prof.msg ? ` (${prof.msg})` : ''));
+      let exp = 0, plan = '';
+      try {
+        const a = await call('type=account_info&action=get_main_info');
+        const d = a && (a.end_date || a.expire_billing_date || a.phone);
+        const t = d ? Date.parse(String(d).replace(' ', 'T')) : NaN;
+        if (isFinite(t)) exp = Math.floor(t / 1000);
+        plan = (a && (a.tariff_plan || a.tariff)) || '';
+      } catch (e) {}
+      return { user_info:{ status:'Active', exp_date: exp || null }, mag:{ mac, portal:base, plan } };
+    },
+    async load(k){
+      if (k === 'live'){
+        const genres = await call('type=itv&action=get_genres').catch(() => []);
+        let list = [];
+        try { list = magList(await call('type=itv&action=get_all_channels')); } catch (e) {}
+        if (!list.length) list = (await pages('type=itv&action=get_ordered_list&genre=*&fav=0&sortby=number', 400)).list;
+        let n = 0;
+        const items = list.map(c => ({ type:'live', id:String(c.id), name:c.name || 'Chaîne', logo:logo(c.logo), cat:String(c.tv_genre_id ?? ''), num:+c.number || 0, cmd:c.cmd || '' }));
+        items.forEach(c => { if (!c.num) c.num = ++n; else n = Math.max(n, c.num); });
+        return { cats:magList(genres).filter(g => g.id !== '*').map(g => ({ id:String(g.id), name:g.title || g.name || 'Catégorie' })), items };
+      }
+      const cats = magList(await call(`type=${T[k]}&action=get_categories`).catch(e => { if (k === 'series') return []; throw e; }));
+      if (k === 'series' && !cats.length) return { cats:[], items:[] };
+      const r = await pages(`type=${T[k]}&action=get_ordered_list&category=*&genre=*&sortby=added&fav=0`, 30);
+      return { cats:cats.filter(c => c.id !== '*').map(c => ({ id:String(c.id), name:c.title || c.name || 'Catégorie' })), items:r.list.map(v => vod(v, k)), lazy:true, total:r.total };
+    },
+    // Une catégorie de films ou de séries, chargée en entier quand on l'ouvre
+    async loadCat(k, cat){
+      if (loaded[k].has(cat)) return [];
+      const r = await pages(`type=${T[k]}&action=get_ordered_list&category=${enc(cat)}&genre=*&sortby=added&fav=0`, 400);
+      loaded[k].add(cat);
+      return r.list.map(v => vod(v, k));
+    },
+    async search(q){
+      const one = k => pages(`type=${T[k]}&action=get_ordered_list&category=*&genre=*&sortby=added&fav=0&search=${enc(q)}`, 3).then(r => r.list.map(v => vod(v, k))).catch(() => []);
+      const [movie, series] = await Promise.all([one('movie'), S.data.series && S.data.series.cats.length ? one('series') : []]);
+      return { movie, series };
+    },
+    async seriesInfo(item){
+      if (item._eps) {
+        const by = new Map();
+        for (const e of item._eps) { if (!by.has(e.season)) by.set(e.season, []); by.get(e.season).push(e); }
+        return { info:{}, seasons:[...by.entries()].sort((a,b) => a[0]-b[0]).map(([num, eps]) => ({ num, episodes:eps.sort((a,b) => a.num-b.num) })) };
+      }
+      const r = await pages(`type=series&action=get_ordered_list&movie_id=${enc(item.id)}&season_id=0&episode_id=0&category=${enc(item.cat || '*')}&sortby=added`, 20);
+      const seasons = [];
+      for (const [i, s] of r.list.entries()){
+        const num = +s.season_number || +String(s.id).split(':')[1] || +((s.name || '').match(/(\d+)/) || [])[1] || i + 1;
+        let eps;
+        if (Array.isArray(s.series) && s.series.length) eps = s.series.map(n => ({ id:`${s.id}-${n}`, season:num, num:+n || 0, title:`Épisode ${n}`, cmd:s.cmd || '', sn:String(n), plot:s.description || '' }));
+        else {
+          const e = await pages(`type=series&action=get_ordered_list&movie_id=${enc(item.id)}&season_id=${enc(s.id)}&episode_id=0`, 20);
+          eps = e.list.map((x, j) => ({ id:String(x.id), season:num, num:+x.series_number || +x.episode_number || j + 1, title:x.name || `Épisode ${j + 1}`, cmd:x.cmd || '', sn:'', plot:x.description || '', img:logo(x.screenshot_uri || '') }));
+        }
+        seasons.push({ num, episodes:eps.sort((a,b) => a.num - b.num) });
+      }
+      seasons.sort((a,b) => a.num - b.num);
+      return { seasons, info:{} };
+    },
+    async vodInfo(item){ return { plot:item.plot, cast:item.cast, director:item.director, genre:item.genre, year:item.year, rating:item.rating, dur:item.dur }; },
+    async epg(item){
+      const js = await call(`type=itv&action=get_short_epg&ch_id=${enc(item.id)}&size=4`);
+      return magList(js).map(e => ({ title:e.name || '', desc:e.descr || '',
+        start:(+e.start_timestamp || Date.parse(String(e.time || '').replace(' ', 'T')) / 1000) * 1000,
+        end:(+e.stop_timestamp || Date.parse(String(e.time_to || '').replace(' ', 'T')) / 1000) * 1000 }));
+    },
+    // Adresse « novamag:// » : le lecteur Android demande le vrai lien au portail au moment de lire
+    url(item, ep){
+      const cmd = ep ? ep.cmd : item.cmd;
+      const t = item.type === 'live' ? 'itv' : 'vod';
+      return `novamag://resolve/${/m3u8/i.test(cmd) ? 'stream.m3u8' : 'stream'}?t=${t}&c=${enc(cmd)}&s=${enc(ep && ep.sn ? ep.sn : '')}`;
+    },
+    async resolve(u){
+      const m = new URL(u), cmd = m.searchParams.get('c') || '';
+      try {
+        const js = await call(`type=${m.searchParams.get('t')}&action=create_link&cmd=${enc(cmd)}&series=${enc(m.searchParams.get('s') || '')}&forced_storage=0&disable_ad=0&download=0`);
+        const real = cmdUrl(js && js.cmd);
+        if (real) return real;
+      } catch (e) {}
+      return cmdUrl(cmd) || u;
+    }
+  };
+  return self;
 }
 
 function parseM3U(text){
@@ -714,7 +894,7 @@ const S = {
   seasons:new Map(), lastQ:'', liveEngine:null, inf:[]
 };
 const keyOf = it => it.type + ':' + it.id;
-const mini = it => { const o = {}; for (const k of ['type','id','name','logo','poster','cat','url','ext','rating','num','year','added']) if (it[k] !== undefined && it[k] !== '') o[k] = it[k]; if (it._eps) o._eps = it._eps; return o; };
+const mini = it => { const o = {}; for (const k of ['type','id','name','logo','poster','cat','url','ext','rating','num','year','added','cmd','plot']) if (it[k] !== undefined && it[k] !== '') o[k] = it[k]; if (it._eps) o._eps = it._eps; return o; };
 const isFav = it => S.favs.has(keyOf(it));
 function toggleFav(it){
   const k = keyOf(it);
@@ -1005,7 +1185,7 @@ function updNow(){
 let epgT = 0;
 async function loadEpg(c){
   const el = $('#epg'); clearTimeout(epgT); if (!el) return;
-  if (S.src.kind !== 'xtream') { el.innerHTML = ''; return; }
+  if (S.src.kind !== 'xtream' && S.src.kind !== 'mag') { el.innerHTML = ''; return; }
   el.innerHTML = `<p class="hint">Chargement du programme…</p>`;
   let list = [];
   try { list = await S.src.epg(c); } catch (e) { list = []; }
@@ -1041,12 +1221,22 @@ function fullscreen(){
 }
 
 /* ================= Films et séries ================= */
+// Ajoute des titres chargés plus tard (catégorie ou recherche MAG), sans doublon
+function mergeItems(kind, list){
+  const d = S.data[kind]; if (!d || !list) return;
+  if (!d._keys) d._keys = new Set(d.items.map(keyOf));
+  for (const it of list){
+    const key = keyOf(it);
+    if (d._keys.has(key)) continue;
+    d._keys.add(key); d.items.push(it); S.index.set(key, it);
+  }
+}
 function viewCatalog(p, kind){
   const d = S.data[kind], title = kind === 'movie' ? 'Films' : 'Séries';
   if (!d || !d.items.length) { main.innerHTML = sectionMissing(kind, title); return; }
   const C = S.cat[kind];
   const counts = new Map(); d.items.forEach(x => counts.set(x.cat, (counts.get(x.cat) || 0) + 1));
-  const cats = d.cats.filter(c => counts.get(c.id));
+  const cats = d.lazy ? d.cats : d.cats.filter(c => counts.get(c.id));
   main.innerHTML = `<div class="page-head"><h1>${title}</h1><span class="count" id="cnt"></span>
     <select id="sort" aria-label="Trier"><option value="recent">Ajoutés récemment</option><option value="az">De A à Z</option><option value="rating">Les mieux notés</option><option value="year">Les plus récents (année)</option></select></div>
     <div class="chips" id="chips"><button class="chip${!C.cat ? ' on' : ''}" data-c="">Tout</button><button class="chip${C.cat === '__fav' ? ' on' : ''}" data-c="__fav">♡ Ma liste</button>${cats.map(c => `<button class="chip${C.cat === c.id ? ' on' : ''}" data-c="${esc(c.id)}">${esc(c.name)}</button>`).join('')}</div>
@@ -1054,12 +1244,20 @@ function viewCatalog(p, kind){
   $('#sort').value = C.sort;
   const draw = () => {
     S.inf.forEach(h => h.stop()); S.inf = [];
+    if (d.lazy && C.cat && C.cat !== '__fav' && S.src.loadCat && !(d.done || (d.done = new Set())).has(C.cat)) {
+      const want = C.cat;
+      $('#cnt').textContent = '';
+      $('#grid').innerHTML = `<p class="hint" style="grid-column:1/-1;font-size:15px">Chargement de la catégorie…</p>`;
+      S.src.loadCat(kind, want).then(list => { mergeItems(kind, list); d.done.add(want); }, e => { d.done.add(want); toast(e.message || 'Chargement impossible'); })
+        .finally(() => { if (S.view === kind && C.cat === want && $('#grid')) draw(); });
+      return;
+    }
     let it = C.cat === '__fav' ? favItems(kind) : C.cat ? d.items.filter(x => x.cat === C.cat) : d.items.slice();
     if (C.sort === 'recent') it.sort((a,b) => b.added - a.added);
     else if (C.sort === 'az') it.sort((a,b) => a.name.localeCompare(b.name, 'fr', { sensitivity:'base' }));
     else if (C.sort === 'rating') it.sort((a,b) => b.rating - a.rating);
     else it.sort((a,b) => (+b.year || 0) - (+a.year || 0));
-    $('#cnt').textContent = `${fr(it.length)} titre${it.length > 1 ? 's' : ''}`;
+    $('#cnt').textContent = `${fr(it.length)} titre${it.length > 1 ? 's' : ''}${d.lazy && !C.cat ? ' récents · choisis une catégorie pour tout voir' : ''}`;
     if (!it.length) { $('#grid').innerHTML = `<p class="empty" style="grid-column:1/-1">${C.cat === '__fav' ? 'Ajoute des titres à Ma liste depuis leur fiche.' : 'Aucun titre dans cette catégorie.'}</p>`; return; }
     infinite($('#grid'), it, card, { chunk:72 });
   };
@@ -1157,8 +1355,19 @@ function viewSearch(){
       ? sec('Chaînes', lv, tile, 'chan-grid') + sec('Films', mv, card, 'grid') + sec('Séries', sr, card, 'grid')
       : `<div class="empty"><h2>Aucun résultat pour « ${esc(raw)} »</h2><p>Vérifie l'orthographe, ou essaie un seul mot du titre.</p></div>`;
   };
-  inp.addEventListener('input', () => { clearTimeout(t); t = setTimeout(run, 180); });
-  run();
+  let rt = 0;
+  const remote = () => {
+    if (!S.src.search) return;
+    clearTimeout(rt);
+    const raw = inp.value.trim(); if (raw.length < 3) return;
+    rt = setTimeout(async () => {
+      const r = await S.src.search(raw).catch(() => null);
+      if (!r || S.view !== 'search' || inp.value.trim() !== raw) return;
+      mergeItems('movie', r.movie); mergeItems('series', r.series); run();
+    }, 500);
+  };
+  inp.addEventListener('input', () => { clearTimeout(t); t = setTimeout(run, 180); remote(); });
+  run(); remote();
 }
 
 /* ================= Ma liste ================= */
@@ -1181,6 +1390,12 @@ function viewSettings(){
       <dt>Utilisateur</dt><dd>${esc(ui.username || S.profile.user)}</dd>
       <dt>Serveur</dt><dd style="word-break:break-all">${esc(S.src.base)}</dd>
       ${si && si.timezone ? `<dt>Fuseau</dt><dd>${esc(si.timezone)}</dd>` : ''}</dl></div>`
+    : S.src.kind === 'mag' && S.acct ? `<div class="panel"><h2>Abonnement MAG</h2><dl class="kv">
+      <dt>Statut</dt><dd class="ok">Actif</dd>
+      <dt>Expire le</dt><dd>${S.acct.user_info.exp_date ? d(S.acct.user_info.exp_date) : 'Non communiqué'}</dd>
+      <dt>Adresse MAC</dt><dd>${esc(S.acct.mag.mac)}</dd>
+      ${S.acct.mag.plan ? `<dt>Formule</dt><dd>${esc(S.acct.mag.plan)}</dd>` : ''}
+      <dt>Portail</dt><dd style="word-break:break-all">${esc(S.acct.mag.portal)}</dd></dl></div>`
     : `<div class="panel"><h2>Source</h2><p class="hint" style="font-size:14px">${S.profile.mode === 'demo' ? 'Démo avec des flux de test publics.' : 'Playlist M3U.'}</p></div>`;
   const total = k => S.data[k] ? fr(S.data[k].items.length) : '—';
   main.innerHTML = `<div class="page-head"><h1>Réglages</h1></div><div class="set-grid">${acct}
@@ -1278,7 +1493,7 @@ function playLiveNative(c){
   S.nativeLive = list;
   const k = keyOf(c); S.liveRecent = [k, ...S.liveRecent.filter(x => x !== k)].slice(0, 40); store.set('liveRecent', S.liveRecent);
   updNow(); markChan(); lstate('native'); loadEpg(c);
-  NATIVE.play(JSON.stringify({ mode:'live', index:i, start:0,
+  NATIVE.play(JSON.stringify({ mode:'live', index:i, start:0, mag:S.src.native ? S.src.native() : null,
     items:list.map(x => ({ url:S.src.url(x), title:x.name, sub:[x.num ? 'Chaîne ' + x.num : '', catName(x)].filter(Boolean).join(' · '), num:x.num || 0 })) }));
 }
 function playVodNative(item, ep, start, fetched){
@@ -1302,7 +1517,7 @@ function playVodNative(item, ep, start, fetched){
   const at = start != null ? start : (pr && pr.t > 30 && pr.t < pr.d * 0.94 ? pr.t : 0);
   const launch = s => {
     S.nativeVod = { item, list };
-    NATIVE.play(JSON.stringify({ mode:'vod', index:0, start:Math.round(s * 1000), items:list.map(x => ({ url:x.url, title:x.title, sub:x.sub, num:0 })) }));
+    NATIVE.play(JSON.stringify({ mode:'vod', index:0, start:Math.round(s * 1000), mag:S.src.native ? S.src.native() : null, items:list.map(x => ({ url:x.url, title:x.title, sub:x.sub, num:0 })) }));
   };
   if (start == null && at) {
     P.cur = { item, ep, key:list[0].key, url:list[0].url, next:null, native:launch };
@@ -1439,7 +1654,7 @@ let mode = 'xtream', fileText = '';
 $$('.seg button').forEach(b => b.addEventListener('click', () => {
   mode = b.dataset.mode;
   $$('.seg button').forEach(x => x.setAttribute('aria-selected', x === b));
-  $('#fx').hidden = mode !== 'xtream'; $('#fm').hidden = mode !== 'm3u'; loginErr('');
+  $('#fx').hidden = mode !== 'xtream'; $('#fm').hidden = mode !== 'm3u'; $('#fg').hidden = mode !== 'mag'; loginErr('');
 }));
 $('#pwShow').onclick = () => { const i = $('#xPass'); const show = i.type === 'password'; i.type = show ? 'text' : 'password'; $('#pwShow').textContent = show ? 'Masquer' : 'Afficher'; };
 $('#mFile').addEventListener('change', e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => { fileText = String(r.result); loginErr(''); }; r.readAsText(f); });
@@ -1460,6 +1675,17 @@ $('#fm').addEventListener('submit', e => {
   if (fileText) return connect({ mode:'m3u', text:fileText });
   loginErr('Colle un lien de playlist, ou choisis un fichier .m3u.');
 });
+$('#gMac').addEventListener('input', e => {
+  const i = e.target, h = i.value.toUpperCase().replace(/[^0-9A-F]/g, '').slice(0, 12);
+  const v = h.match(/.{1,2}/g)?.join(':') || '';
+  if (v !== i.value) i.value = v;
+});
+$('#fg').addEventListener('submit', e => {
+  e.preventDefault();
+  const mac = normMac($('#gMac').value);
+  if (!mac) return loginErr('Adresse MAC incomplète : il faut 12 caractères, par exemple 00:1A:79:12:34:56.');
+  connect({ mode:'mag', portal:$('#gPortal').value.trim(), mac });
+});
 $('#demoBtn').onclick = () => connect({ mode:'demo' });
 
 function step(id, label){ $('#steps').insertAdjacentHTML('beforeend', `<li id="st-${id}"><span class="dot"></span><span>${label}</span><em></em></li>`); }
@@ -1468,15 +1694,17 @@ function stepDone(id, ok, txt){ const li = $('#st-' + id); if (!li) return; li.c
 async function connect(profile, { reload = false } = {}){
   $('#shell').hidden = true; P.el.hidden = true;
   $('#login').hidden = false; $('#loginForm').hidden = true; $('#loadBox').hidden = false; $('#steps').innerHTML = '';
-  const src = profile.mode === 'xtream' ? xtreamSource(profile) : m3uSource(profile.mode === 'demo' ? { text:DEMO } : profile);
-  step('auth', profile.mode === 'xtream' ? 'Connexion au serveur' : 'Lecture de la playlist');
+  const src = profile.mode === 'xtream' ? xtreamSource(profile) : profile.mode === 'mag' ? magSource(profile) : m3uSource(profile.mode === 'demo' ? { text:DEMO } : profile);
+  step('auth', profile.mode === 'xtream' ? 'Connexion au serveur' : profile.mode === 'mag' ? 'Connexion au portail MAG' : 'Lecture de la playlist');
   let acct = null;
   try { acct = await src.auth(); stepDone('auth', true, 'OK'); }
   catch (e) {
     $('#loadBox').hidden = true; $('#loginForm').hidden = false;
     loginErr(e.message);
-    if (IS_TV) setTimeout(() => tvFocus($('#fx button[type=submit]')), 50);
     if (profile.mode === 'xtream') { $('#xServer').value = profile.server; $('#xUser').value = profile.user; }
+    if (profile.mode === 'mag') { $('#gPortal').value = profile.portal; $('#gMac').value = profile.mac; }
+    if (profile.mode === 'xtream' || profile.mode === 'mag') { const b = $(`.seg button[data-mode="${profile.mode}"]`); if (b && b.getAttribute('aria-selected') !== 'true') b.click(); loginErr(e.message); }
+    if (IS_TV) setTimeout(() => tvFocus($(`#${profile.mode === 'mag' ? 'fg' : 'fx'} button[type=submit]`)), 50);
     return;
   }
   S.src = src; S.acct = acct; S.profile = profile; S.err = {}; S.seasons.clear();
